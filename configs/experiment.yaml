@@ -1,0 +1,36 @@
+# Experiment configuration
+model:
+  name: "TheBloke/Llama-2-70B-chat-GPTQ"
+  size: "70B"
+  quantization: "gptq-4bit"
+  max_new_tokens: 512
+  temperature: 0.7
+  num_paths: 5  # for SC-CoT and SEA-CoT
+
+datasets:
+  - name: strategyqa
+    split: test
+    max_samples: null  # null = use all
+  - name: obqa
+    split: test
+    max_samples: null
+  - name: qasc
+    split: test
+    max_samples: null
+
+prompting_methods:
+  - cot
+  - sc_cot
+  - sea_cot
+  - question_decomp
+  - self_refine
+
+evaluation:
+  perturbation_model: "gpt-3.5-turbo"  # for paraphrase and mistake
+  counterfactual_model: "gpt-4"        # for counterfactual
+  student_model: "google-t5/t5-base"   # for LAS
+  entailment_model: "cross-encoder/nli-deberta-v3-base"  # for SEA-CoT
+
+seeds: [42, 123, 456]
+
+output_dir: "results"

@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (too large for git)
+data/*/raw/
+data/*/processed.jsonl
+data/*/perturbations/
+
+# Model checkpoints
+checkpoints/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Results (keep structure, track tables)
+results/raw/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# API keys
+.env
+*.key
