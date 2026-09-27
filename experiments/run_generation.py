@@ -43,6 +43,8 @@ def parse_args():
                         help="Use HuggingFace Inference API instead of local model")
     parser.add_argument("--api-model", type=str, default=None,
                         help="API model name (for --use-api)")
+    parser.add_argument("--lightweight", action="store_true",
+                        help="Use lightweight model (TinyLlama-1.1B) for CPU/Mac")
     return parser.parse_args()
 
 
@@ -95,12 +97,13 @@ def main():
         print(f"  Using first {args.max_samples} examples")
 
     # 2. Load model
-    print(f"Loading model: Llama-2-{args.model_size}")
+    print(f"Loading model...")
     size_num = args.model_size.replace("B", "")
     model = get_model(
         use_api=args.use_api,
         size=size_num,
-        api_model=args.api_model
+        api_model=args.api_model,
+        lightweight=args.lightweight
     )
     print("  Model loaded successfully")
 

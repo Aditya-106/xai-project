@@ -43,6 +43,8 @@ def parse_args():
                         choices=["7B", "13B", "70B"])
     parser.add_argument("--use-api", action="store_true")
     parser.add_argument("--api-model", type=str, default=None)
+    parser.add_argument("--lightweight", action="store_true",
+                        help="Use lightweight model (TinyLlama-1.1B) for CPU/Mac")
     parser.add_argument("--data-dir", type=str, default="data",
                         help="Directory containing pre-generated reasoning paths")
     parser.add_argument("--output-dir", type=str, default="results")
@@ -186,9 +188,10 @@ def main():
     print(f"  Using {len(dataset)} examples")
 
     # 2. Load model
-    print(f"Loading model: Llama-2-{args.model_size}")
+    print(f"Loading model...")
     size_num = args.model_size.replace("B", "")
-    model = get_model(use_api=args.use_api, size=size_num, api_model=args.api_model)
+    model = get_model(use_api=args.use_api, size=size_num, api_model=args.api_model,
+                      lightweight=args.lightweight)
 
     # 3. Load entailment scorer
     print("Loading entailment scorer...")
