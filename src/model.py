@@ -104,6 +104,68 @@ class LocalLightModel(LLMInterface):
 
         return results
 
+    def generate_chat(self, question: str, max_new_tokens: int = 150,
+                      temperature: float = 0.7) -> tuple:
+        import torch
+        messages = [
+            {"role": "system", "content": "You are a precise reasoning assistant. Think step by step and end your response with 'Answer: Yes' or 'Answer: No'."},
+            {"role": "user", "content": f"Question: {question}"}
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0.0),
+                temperature=max(temperature, 0.01) if temperature > 0.0 else 1.0,
+                top_p=0.9 if temperature > 0.0 else 1.0,
+                pad_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+
+        text = self.tokenizer.decode(outputs.sequences[0][input_len:], skip_special_tokens=True).strip()
+        try:
+            transition_scores = self.model.compute_transition_scores(
+                outputs.sequences, outputs.scores, normalize_logits=True
+            )
+            avg_log_prob = float(transition_scores[0].mean().cpu().numpy()) if len(transition_scores[0]) > 0 else -10.0
+        except Exception:
+            avg_log_prob = -10.0
+
+        return text, avg_log_prob
+
+    def predict_given_reasoning(self, reasoning: str, question: str) -> str:
+        import torch, re
+        messages = [
+            {"role": "system", "content": "Based ONLY on the provided reasoning, answer the question with 'Answer: Yes' or 'Answer: No'."},
+            {"role": "user", "content": f"Reasoning: {reasoning}\nQuestion: {question}"}
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        input_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=25, do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        text = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip().lower()
+        
+        match = re.search(r'answer:\s*(yes|no)', text)
+        if match:
+            return match.group(1)
+        if text.startswith('yes'):
+            return 'yes'
+        if text.startswith('no'):
+            return 'no'
+        if re.search(r'\byes\b', text):
+            return 'yes'
+        if re.search(r'\bno\b', text):
+            return 'no'
+        return 'yes'
+
 
 class APIModel(LLMInterface):
     """Uses HuggingFace Inference API."""

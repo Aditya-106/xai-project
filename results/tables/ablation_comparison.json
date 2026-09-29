@@ -33,34 +33,69 @@
   },
   "ours": {
     "Random": {
-      "P": 0.0,
-      "CF-UF": 55.0,
-      "M": 0.0,
-      "S": 10.2
+      "P": 6.67,
+      "CF-UF": 33.33,
+      "M": 13.33,
+      "S": -2.13
     },
     "Max": {
       "P": 0.0,
-      "CF-UF": 55.0,
-      "M": 0.0,
-      "S": 13.89
+      "CF-UF": 53.33,
+      "M": 13.33,
+      "S": -10.11
     },
     "Overlap": {
-      "P": 0.0,
-      "CF-UF": 55.0,
-      "M": 0.0,
-      "S": 16.09
+      "P": 6.67,
+      "CF-UF": 60.0,
+      "M": 6.67,
+      "S": 3.69
     },
     "Entailment": {
-      "P": 0.0,
-      "CF-UF": 55.0,
-      "M": 0.0,
-      "S": 8.06
+      "P": 6.67,
+      "CF-UF": 60.0,
+      "M": 13.33,
+      "S": 4.9
     },
     "O&E (SEA)": {
-      "P": 0.0,
-      "CF-UF": 55.0,
-      "M": 0.0,
-      "S": 16.06
+      "P": 6.67,
+      "CF-UF": 66.67,
+      "M": 13.33,
+      "S": 4.08
+    }
+  },
+  "config": {
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "nli_model": "cross-encoder/nli-deberta-v3-base",
+    "t5_model": "google-t5/t5-small",
+    "n_samples": 15,
+    "n_paths": 3,
+    "seed": 42,
+    "accuracy": 60.0
+  },
+  "trend_analysis": {
+    "P": {
+      "spearman_rho": -0.5,
+      "paper_best": "O&E (SEA)",
+      "our_best": "Max",
+      "best_matches": false
+    },
+    "CF-UF": {
+      "spearman_rho": -0.8,
+      "paper_best": "O&E (SEA)",
+      "our_best": "Random",
+      "best_matches": false
+    },
+    "M": {
+      "spearman_rho": -0.7,
+      "paper_best": "Overlap",
+      "our_best": "Random",
+      "best_matches": false
+    },
+    "S": {
+      "spearman_rho": 0.6,
+      "paper_best": "O&E (SEA)",
+      "our_best": "Entailment",
+      "best_matches": false
     }
   }
 }

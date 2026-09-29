@@ -1,11 +1,12 @@
 """
 Analysis and Results Visualization Script
 ==========================================
-Run this script to generate all comparison tables and figures.
-This is the script you demo during your presentation.
+Run this script to generate all comparison tables and figures,
+including side-by-side comparison with the original paper's results.
 
 Usage:
     python notebooks/analysis.py
+    python notebooks/analysis.py --results-file results/tables/ablation_comparison.json
 """
 import json
 import os
@@ -59,7 +60,16 @@ def print_section(title: str):
     print(f"{'═'*70}")
 
 
-def display_ablation_table():
+def load_our_results(results_file: str = "results/tables/ablation_comparison.json") -> dict:
+    """Load our reproduced results from the JSON file."""
+    if os.path.exists(results_file):
+        with open(results_file) as f:
+            data = json.load(f)
+        return data
+    return None
+
+
+def display_ablation_table(our_data=None):
     """Display the SEA-CoT ablation study results (Paper Table 1)."""
     print_section("RESULT 1: SEA-CoT Ablation Study (Paper Table 1)")
     print("\nDataset: StrategyQA | Model: Llama-2-70B-chat-GPTQ")
@@ -71,6 +81,37 @@ def display_ablation_table():
     print("Key finding: O&E (SEA-CoT) achieves the best P (1.20) and CF-UF (3.81),")
     print("and the highest simulatability S (16.97), demonstrating that combining")
     print("entailment + overlap scoring selects the most interpretable explanations.")
+
+    if our_data and "ours" in our_data:
+        print("\n" + "-"*70)
+        print("  OUR REPRODUCED RESULTS:")
+        print("-"*70)
+        ours = our_data["ours"]
+        mapping = {
+            "Random": "Random", "Max": "Max", "Overlap": "Overlap",
+            "Entailment": "Entailment", "O&E (SEA)": "O&E (SEA-CoT)"
+        }
+        rows = []
+        for key, display_name in mapping.items():
+            if key in ours:
+                rows.append({
+                    "Method": display_name,
+                    "P ↓": ours[key]["P"],
+                    "CF-UF ↓": ours[key]["CF-UF"],
+                    "M ↑": ours[key]["M"],
+                    "S ↑": ours[key]["S"],
+                })
+        if rows:
+            our_df = pd.DataFrame(rows)
+            print()
+            print(our_df.to_string(index=False))
+
+            if "config" in our_data:
+                cfg = our_data["config"]
+                print(f"\n  Model: {cfg.get('model', 'N/A')}")
+                print(f"  NLI:   {cfg.get('nli_model', 'N/A')}")
+                print(f"  LAS:   {cfg.get('t5_model', 'N/A')}")
+                print(f"  N:     {cfg.get('n_samples', 'N/A')} examples")
 
 
 def display_cross_method_table():
@@ -96,30 +137,103 @@ def display_model_size_table():
     print("with the lowest P and CF-UF scores and the highest simulatability.")
 
 
-def plot_ablation_chart(save_dir: str = "results/figures"):
+def display_trend_analysis(our_data):
+    """Display trend agreement analysis between paper and our results."""
+    if not our_data or "trend_analysis" not in our_data:
+        return
+
+    print_section("TREND ANALYSIS: Strategy Rankings (Paper vs Ours)")
+    trends = our_data["trend_analysis"]
+    print(f"\n  {'Metric':>6}  {'Spearman ρ':>12}  {'Paper Best':<16}  {'Our Best':<16}  {'Match?':>8}")
+    print("  " + "-"*65)
+
+    for metric in ["P", "CF-UF", "M", "S"]:
+        if metric in trends:
+            t = trends[metric]
+            match_str = "✓ YES" if t["best_matches"] else "✗ NO"
+            rho_str = f"{t['spearman_rho']:+.3f}"
+            print(f"  {metric:>6}  {rho_str:>12}  {t['paper_best']:<16}  "
+                  f"{t['our_best']:<16}  {match_str:>8}")
+
+    print()
+    # Interpretation
+    rhos = [trends[m]["spearman_rho"] for m in ["P", "CF-UF", "M", "S"] if m in trends]
+    matches = sum(1 for m in ["P", "CF-UF", "M", "S"] if m in trends and trends[m]["best_matches"])
+    avg_rho = np.mean(rhos) if rhos else 0
+
+    print(f"  Average Spearman ρ: {avg_rho:+.3f}")
+    print(f"  Best-strategy matches: {matches}/4")
+    print()
+    if avg_rho > 0.5:
+        print("  ✓ STRONG trend agreement — rankings are consistent with the paper.")
+    elif avg_rho > 0.0:
+        print("  ~ MODERATE trend agreement — partial consistency with the paper.")
+    else:
+        print("  ✗ WEAK trend agreement — rankings differ from the paper.")
+        print("    This is expected with a much smaller model.")
+    print("  Note: Absolute metric values differ due to model size difference.")
+    print("  The key finding is whether SEA-CoT (O&E) still ranks near the top.")
+
+
+def plot_ablation_chart(save_dir: str = "results/figures", our_data=None):
     """Generate ablation bar chart."""
     df = PAPER_ABLATION_STRATEGYQA
     metrics = ["P ↓", "CF-UF ↓", "M ↑", "S ↑"]
     methods = df["Method"].tolist()
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 5))
-    fig.suptitle("SEA-CoT Ablation Study on StrategyQA (Paper Table 1)",
-                 fontsize=14, fontweight='bold')
+    has_ours = our_data and "ours" in our_data
+    n_groups = 2 if has_ours else 1
+
+    fig, axes = plt.subplots(1, 4, figsize=(16 + (4 if has_ours else 0), 5))
+    title = "SEA-CoT Ablation Study on StrategyQA (Paper Table 1)"
+    if has_ours:
+        title += "\nPaper (blue) vs Our Reproduction (red)"
+    fig.suptitle(title, fontsize=14, fontweight='bold')
 
     colors = ['#2196F3', '#4CAF50', '#FF9800', '#9C27B0', '#F44336']
+    mapping = ["Random", "Max", "Overlap", "Entailment", "O&E (SEA)"]
 
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
-        values = df[metric].tolist()
-        bars = ax.bar(range(len(methods)), values, color=colors, edgecolor='black', linewidth=0.5)
-        ax.set_title(metric, fontweight='bold', fontsize=13)
-        ax.set_xticks(range(len(methods)))
-        ax.set_xticklabels([m.replace("(SEA-CoT)", "\n(SEA-CoT)") for m in methods],
-                           rotation=45, ha='right', fontsize=8)
+        metric_key = metric.replace(" ↓", "").replace(" ↑", "")
+        paper_values = df[metric].tolist()
 
-        for bar, val in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
-                    f'{val:.1f}', ha='center', va='bottom', fontsize=8)
+        if has_ours:
+            our_values = []
+            for m in mapping:
+                if m in our_data["ours"]:
+                    our_values.append(our_data["ours"][m].get(metric_key, 0))
+                else:
+                    our_values.append(0)
+
+            x = np.arange(len(methods))
+            w = 0.35
+            bars1 = ax.bar(x - w/2, paper_values, w, label='Paper (70B)',
+                          color='#2196F3', edgecolor='black', linewidth=0.5)
+            bars2 = ax.bar(x + w/2, our_values, w, label='Ours',
+                          color='#F44336', edgecolor='black', linewidth=0.5)
+
+            for bar, val in zip(bars1, paper_values):
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                        f'{val:.1f}', ha='center', va='bottom', fontsize=7)
+            for bar, val in zip(bars2, our_values):
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                        f'{val:.1f}', ha='center', va='bottom', fontsize=7)
+
+            ax.set_xticks(x)
+            if idx == 0:
+                ax.legend(fontsize=8)
+        else:
+            bars = ax.bar(range(len(methods)), paper_values, color=colors,
+                         edgecolor='black', linewidth=0.5)
+            ax.set_xticks(range(len(methods)))
+            for bar, val in zip(bars, paper_values):
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                        f'{val:.1f}', ha='center', va='bottom', fontsize=8)
+
+        ax.set_title(metric, fontweight='bold', fontsize=13)
+        ax.set_xticklabels([m.replace("(SEA-CoT)", "\n(SEA-CoT)").replace("(SEA)", "\n(SEA)")
+                           for m in methods], rotation=45, ha='right', fontsize=8)
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
@@ -203,35 +317,37 @@ def plot_cross_method_bars(save_dir: str = "results/figures"):
     print(f"  Saved: {save_dir}/cross_method_bars.png")
 
 
-def plot_paper_vs_ours(our_results: dict = None, save_dir: str = "results/figures"):
-    """Generate paper vs reproduction comparison."""
-    metrics = ["P ↓", "CF-UF ↓", "M ↑", "S ↑"]
+def plot_paper_vs_ours(our_data=None, save_dir: str = "results/figures"):
+    """Generate paper vs reproduction comparison for SEA-CoT."""
+    metrics = ["P", "CF-UF", "M", "S"]
+    metric_labels = ["P ↓", "CF-UF ↓", "M ↑", "S ↑"]
     paper_vals = [1.20, 3.81, 61.24, 16.97]  # SEA-CoT paper values
 
-    if our_results:
-        our_vals = [our_results.get(m, 0) for m in metrics]
+    if our_data and "ours" in our_data and "O&E (SEA)" in our_data["ours"]:
+        sea = our_data["ours"]["O&E (SEA)"]
+        our_vals = [sea.get(m, 0) for m in metrics]
     else:
-        our_vals = [0, 0, 0, 0]  # Placeholder
+        our_vals = [0, 0, 0, 0]
 
     x = np.arange(len(metrics))
     width = 0.35
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bars1 = ax.bar(x - width/2, paper_vals, width, label='Paper',
+    bars1 = ax.bar(x - width/2, paper_vals, width, label='Paper (Llama-2-70B)',
                    color='#2196F3', edgecolor='black')
-    bars2 = ax.bar(x + width/2, our_vals, width, label='Ours',
+    bars2 = ax.bar(x + width/2, our_vals, width, label='Our Reproduction',
                    color='#F44336', edgecolor='black')
 
     ax.set_ylabel('Score')
     ax.set_title('Paper vs Our Reproduction — SEA-CoT on StrategyQA', fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(metrics)
+    ax.set_xticklabels(metric_labels)
     ax.legend()
 
     for bars in [bars1, bars2]:
         for bar in bars:
             h = bar.get_height()
-            if h > 0:
+            if h != 0:
                 ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.2f}',
                         ha='center', va='bottom', fontsize=9)
 
@@ -244,25 +360,49 @@ def plot_paper_vs_ours(our_results: dict = None, save_dir: str = "results/figure
 
 def main():
     """Run full analysis — tables + figures."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Analysis and visualization")
+    parser.add_argument("--results-file", type=str,
+                        default="results/tables/ablation_comparison.json",
+                        help="Path to ablation comparison JSON file")
+    args = parser.parse_args()
+
     print("╔══════════════════════════════════════════════════════════════════════╗")
     print("║  CoT Interpretability Paper Reproduction — Results Analysis        ║")
     print("║  Paper: 'How Interpretable are Reasoning Explanations from         ║")
     print("║          Prompting Large Language Models?' (NAACL 2024)             ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
 
+    # Load our results if available
+    our_data = load_our_results(args.results_file)
+    if our_data:
+        print(f"\n  ✓ Loaded reproduced results from {args.results_file}")
+        if "config" in our_data:
+            cfg = our_data["config"]
+            print(f"    Model: {cfg.get('model', 'N/A')}")
+            print(f"    Samples: {cfg.get('n_samples', 'N/A')}")
+            print(f"    Accuracy: {cfg.get('accuracy', 'N/A'):.1f}%")
+    else:
+        print(f"\n  ⚠ No reproduced results found at {args.results_file}")
+        print("    Showing paper results only. Run 'python run_all.py' first.")
+
     # Display tables
-    display_ablation_table()
+    display_ablation_table(our_data)
     display_cross_method_table()
     display_model_size_table()
+
+    # Trend analysis (only if we have our results)
+    if our_data:
+        display_trend_analysis(our_data)
 
     # Generate figures
     print_section("GENERATING FIGURES")
     save_dir = "results/figures"
 
-    plot_ablation_chart(save_dir)
+    plot_ablation_chart(save_dir, our_data)
     plot_cross_method_radar(save_dir)
     plot_cross_method_bars(save_dir)
-    plot_paper_vs_ours(save_dir=save_dir)
+    plot_paper_vs_ours(our_data, save_dir=save_dir)
 
     # Summary
     print_section("SUMMARY FOR PRESENTATION")
@@ -273,18 +413,25 @@ def main():
     2. Show the generated figures in results/figures/
     3. Walk through the code:
        - src/prompting/sea_cot.py    → SEA-CoT algorithm
-       - src/scoring/entailment.py   → Entailment scoring (S_e)
-       - src/scoring/overlap.py      → Overlap scoring (S_o)
+       - src/scoring/entailment.py   → Entailment scoring (S_e) using DeBERTa NLI
+       - src/scoring/overlap.py      → Overlap scoring (S_o) using token IoU
        - src/evaluation/             → All evaluation metrics
-    4. Compare paper results vs your reproduction
-    5. Discuss any differences
+    4. Compare paper results vs your reproduction (side-by-side tables)
+    5. Discuss trend agreement and absolute differences
+    6. Explain WHY absolute values differ (model size, perturbation method)
 
-    Key numbers to mention:
+    Key numbers from the paper:
     - SEA-CoT achieves P=1.20 (best robustness)
     - SEA-CoT achieves CF-UF=3.81 (best faithfulness)
     - SEA-CoT achieves S=16.97 (best utility)
     - >70% improvement over baselines in interpretability
     """)
+
+    if our_data and "trend_analysis" in our_data:
+        trends = our_data["trend_analysis"]
+        matches = sum(1 for m in ["P", "CF-UF", "M", "S"]
+                     if m in trends and trends[m]["best_matches"])
+        print(f"    Our reproduction: {matches}/4 best-strategy matches with paper")
 
 
 if __name__ == "__main__":

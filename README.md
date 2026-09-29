@@ -46,13 +46,19 @@ We reproduce the paper's proposed **Self-Entailment-Alignment Chain-of-Thought (
 | Entailment | 2.38 | 5.46 | 69.99 | 13.46 |
 | **O&E (SEA-CoT)** | **1.20** | **3.81** | **61.24** | **16.97** |
 
-### Result 2: Main Interpretability Comparison (Paper Figure 5)
+### Result 2: Paper vs Our Reproduction
 
-*See `results/figures/` for generated comparison plots.*
+Run `python run_all.py` to generate a side-by-side comparison with the paper's results.
+The pipeline uses **real NLI scoring** (DeBERTa), **real LAS** (T5), and proper perturbation-based evaluation.
+
+Results are saved to:
+- `results/tables/ablation_comparison.json` — full numerical comparison + trend analysis
+- `results/figures/ablation_paper_vs_ours.png` — side-by-side bar charts
+- `results/figures/trend_comparison_radar.png` — normalized strategy ranking comparison
 
 ### Result 3: Cross-Prompting Interpretability Evaluation
 
-*See `results/tables/` for full tables.*
+*See `results/tables/` for full tables and `results/figures/` for plots.*
 
 ---
 
@@ -155,12 +161,15 @@ python experiments/run_ablation.py --dataset strategyqa
 
 ## Differences from Original Paper
 
-| Aspect | Original | Our Reproduction |
-|--------|----------|-----------------|
-| Model | Llama-2-70B-chat-GPTQ | Same / smaller variant |
-| Dataset size | Full test sets | Full / subset |
-| Perturbation | GPT-3.5 (para/mistake), GPT-4 (CF) | Same / alternative |
-| Seeds | Multiple | Same |
+| Aspect | Original Paper | Our Reproduction |
+|--------|----------------|------------------|
+| LLM | Llama-2-70B-chat-GPTQ (70B) | TinyLlama-1.1B-Chat (or user-specified) |
+| NLI Model | DeBERTa-large-MNLI | cross-encoder/nli-deberta-v3-base (real NLI) |
+| Student (LAS) | T5-base | T5-small (real T5 computation) |
+| Perturbation | GPT-3.5 (para/mistake), GPT-4 (CF) | Local methods (synonym substitution, negation) |
+| Dataset size | Full test sets | Configurable subset (default 50) |
+| Seeds | Multiple | Same (default 42) |
+| Comparison | N/A | Side-by-side tables + Spearman trend analysis |
 
 ---
 

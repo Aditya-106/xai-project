@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-run_all.py — End-to-End Pipeline Runner
-========================================
-Runs the complete reproduction pipeline on your Mac:
-  1. Load StrategyQA dataset
-  2. Generate CoT reasoning chains (using a small local model)
-  3. Run SEA-CoT explanation selection (entailment + overlap scoring)
-  4. Run the ablation study (5 selection strategies)
-  5. Compare with paper's reported results
-  6. Generate publication-quality figures
+run_all.py — End-to-End Pipeline Runner (Paper Replication)
+=====================================================================
+Reproduces key experiments from the paper:
+  "How Interpretable are Reasoning Explanations from Prompting
+   Large Language Models?" — Yeo et al., NAACL 2024 Findings
 
-Usage:
-    source venv/bin/activate
-    python3 run_all.py                    # default: 20 examples, tiny model
-    python3 run_all.py --max-samples 50   # more examples
-    python3 run_all.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0  # better model
+Ablation Strategies Evaluated (Table 1):
+  1. Random: Randomly select one candidate explanation
+  2. Max: Select candidate explanation with highest log probability (SC-CoT)
+  3. Overlap: Select candidate by highest token IoU overlap S_o
+  4. Entailment: Select candidate by highest DeBERTa NLI score S_e
+  5. O&E (SEA-CoT): Select candidate by highest S_T = S_e + S_o
+
+Evaluation Metrics:
+  - Paraphrase flip rate (P ↓)
+  - Counterfactual Unfaithfulness (CF-UF ↓)
+  - Mistake flip rate (M ↑)
+  - Simulatability / LAS (S ↑)
 """
+
 import json
 import os
 import sys
 import random
+import re
 import time
 import argparse
 from pathlib import Path
@@ -28,11 +33,14 @@ from collections import Counter
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    T5ForConditionalGeneration, T5Tokenizer,
+)
 
 # ═══════════════════════════════════════════════════════════════
-# PAPER'S REPORTED RESULTS
+# PAPER'S REPORTED RESULTS (from Table 1, NAACL 2024)
 # ═══════════════════════════════════════════════════════════════
 
 PAPER_ABLATION = {
@@ -53,70 +61,170 @@ PAPER_CROSS_METHOD = {
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. LIGHTWEIGHT MODEL
+# 1. MODEL CLASSES
 # ═══════════════════════════════════════════════════════════════
 
-class LightweightLM:
-    """Small causal LM for pipeline demonstration."""
+def parse_answer(text: str) -> str:
+    """Extract yes/no answer cleanly using regex."""
+    text_lower = text.lower()
+    match = re.search(r'answer:\s*(yes|no)', text_lower)
+    if match:
+        return match.group(1)
+    if text_lower.startswith('yes'):
+        return 'yes'
+    if text_lower.startswith('no'):
+        return 'no'
+    if re.search(r'\byes\b', text_lower):
+        return 'yes'
+    if re.search(r'\bno\b', text_lower):
+        return 'no'
+    return 'yes'
 
-    def __init__(self, model_name: str = "sshleifer/tiny-gpt2"):
-        print(f"  Loading model: {model_name}")
+
+class LightweightLM:
+    """LLM wrapper supporting chat templates & sequence log-probabilities."""
+
+    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+        print(f"  Loading LLM: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        self.model.eval()
-        self.model_name = model_name
-        print(f"  Model loaded ({sum(p.numel() for p in self.model.parameters())/1e6:.1f}M params)")
 
-    def generate(self, prompt: str, max_new_tokens: int = 150,
-                 temperature: float = 0.7, num_return_sequences: int = 1):
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float32
+        ).to(self.device)
+        self.model.eval()
+        param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
+        print(f"  LLM loaded on {self.device} ({param_count:.1f}M params)")
+
+    def generate_cot(self, question: str, max_new_tokens: int = 120, temperature: float = 0.7) -> dict:
+        """Generate a single CoT path with sequence log probability."""
+        messages = [
+            {"role": "system", "content": "You are a precise reasoning assistant. Think step by step and end your response with 'Answer: Yes' or 'Answer: No'."},
+            {"role": "user", "content": f"Question: {question}"}
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
         input_len = inputs["input_ids"].shape[1]
 
-        results = []
-        for _ in range(num_return_sequences):
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0.0),
+                temperature=max(temperature, 0.01) if temperature > 0.0 else 1.0,
+                top_p=0.9 if temperature > 0.0 else 1.0,
+                pad_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+
+        text = self.tokenizer.decode(outputs.sequences[0][input_len:], skip_special_tokens=True).strip()
+        try:
+            transition_scores = self.model.compute_transition_scores(
+                outputs.sequences, outputs.scores, normalize_logits=True
+            )
+            avg_log_prob = float(transition_scores[0].mean().cpu().numpy()) if len(transition_scores[0]) > 0 else -10.0
+        except Exception:
+            avg_log_prob = -10.0
+
+        ans = parse_answer(text)
+        return {"text": text, "log_prob": avg_log_prob, "answer": ans}
+
+    def predict_given_reasoning(self, reasoning: str, question: str) -> str:
+        """Predict yes/no given a specific reasoning chain in prompt context."""
+        messages = [
+            {"role": "system", "content": "Based ONLY on the provided reasoning, answer the question with 'Answer: Yes' or 'Answer: No'."},
+            {"role": "user", "content": f"Reasoning: {reasoning}\nQuestion: {question}"}
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=25, do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        text = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        return parse_answer(text)
+
+
+class NLIScorer:
+    """NLI entailment scorer automatically mapping label indices."""
+
+    def __init__(self, model_name: str = "cross-encoder/nli-deberta-v3-base"):
+        print(f"  Loading NLI model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.device = "cpu"
+        self.model.to(self.device)
+        self.model.eval()
+
+        id2label = getattr(self.model.config, "id2label", {})
+        self.entailment_idx = 1
+        for idx, label in id2label.items():
+            if "entail" in str(label).lower():
+                self.entailment_idx = int(idx)
+                break
+        print(f"  NLI model loaded (entailment_label_idx={self.entailment_idx})")
+
+    def score(self, premise: str, hypothesis: str) -> float:
+        if not premise.strip() or not hypothesis.strip():
+            return 0.0
+        inputs = self.tokenizer(
+            premise, hypothesis, return_tensors="pt", truncation=True, max_length=512
+        ).to(self.device)
+        with torch.no_grad():
+            logits = self.model(**inputs).logits
+            probs = torch.softmax(logits, dim=1)
+        return probs[0][self.entailment_idx].item()
+
+
+class T5StudentModel:
+    """T5 student model for Leakage-Adjusted Simulatability (LAS)."""
+
+    def __init__(self, model_name: str = "google-t5/t5-small"):
+        print(f"  Loading T5 student: {model_name}")
+        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+        self.model = T5ForConditionalGeneration.from_pretrained(model_name)
+        self.device = "cpu"
+        self.model.to(self.device)
+        self.model.eval()
+        print(f"  T5 student loaded")
+
+    def predict_probs(self, prompt: str, targets: list = ["yes", "no"]) -> dict:
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        probs = {}
+        for target in targets:
+            labels = self.tokenizer(target, return_tensors="pt").input_ids.to(self.device)
             with torch.no_grad():
-                kwargs = dict(
-                    **inputs, max_new_tokens=max_new_tokens,
-                    do_sample=(temperature > 0), pad_token_id=self.tokenizer.eos_token_id,
-                )
-                if temperature > 0:
-                    kwargs["temperature"] = temperature
-                    kwargs["top_p"] = 0.9
-                output = self.model.generate(**kwargs)
-            text = self.tokenizer.decode(output[0][input_len:], skip_special_tokens=True)
-            results.append(text.strip())
-        return results
+                outputs = self.model(**inputs, labels=labels)
+                loss = outputs.loss.item()
+                probs[target] = float(np.exp(-loss))
+        total = sum(probs.values())
+        if total > 0:
+            return {k: v / total for k, v in probs.items()}
+        return {k: 0.5 for k in targets}
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2. SCORING FUNCTIONS (from the paper)
+# 2. SCORING & PERTURBATION FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
 def calculate_overlap_score(explanation: str, question_answer: str) -> float:
-    """
-    Token-level IoU between explanation and question+answer.
-    S_o = |ê_i ∩ (x ⊕ ŷ)| / |ê_i ∪ (x ⊕ ŷ)|
-    Stopwords are removed.
-    """
-    import re
-    try:
-        from nltk.corpus import stopwords
-        stop_words = set(stopwords.words('english'))
-    except Exception:
-        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-                      'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-                      'would', 'could', 'should', 'may', 'might', 'can', 'shall',
-                      'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-                      'as', 'into', 'through', 'during', 'before', 'after', 'and',
-                      'but', 'or', 'nor', 'not', 'so', 'yet', 'both', 'either',
-                      'neither', 'each', 'every', 'all', 'any', 'few', 'more',
-                      'most', 'other', 'some', 'such', 'no', 'only', 'own', 'same',
-                      'than', 'too', 'very', 'just', 'because', 'if', 'it', 'its',
-                      'this', 'that', 'these', 'those', 'i', 'me', 'my', 'we', 'our',
-                      'you', 'your', 'he', 'him', 'his', 'she', 'her', 'they', 'them'}
-
+    """IoU token overlap between explanation and question+answer hypothesis."""
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                  'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                  'would', 'could', 'should', 'may', 'might', 'can', 'shall',
+                  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+                  'as', 'into', 'through', 'during', 'before', 'after', 'and',
+                  'but', 'or', 'nor', 'not', 'so', 'yet', 'both', 'either',
+                  'neither', 'each', 'every', 'all', 'any', 'few', 'more',
+                  'most', 'other', 'some', 'such', 'no', 'only', 'own', 'same',
+                  'than', 'too', 'very', 'just', 'because', 'if', 'it', 'its',
+                  'this', 'that', 'these', 'those', 'i', 'me', 'my', 'we', 'our',
+                  'you', 'your', 'he', 'him', 'his', 'she', 'her', 'they', 'them'}
     def tokenize(text):
         tokens = re.findall(r'\b\w+\b', text.lower())
         return set(t for t in tokens if t not in stop_words)
@@ -130,211 +238,84 @@ def calculate_overlap_score(explanation: str, question_answer: str) -> float:
     return len(intersection) / len(union) if union else 0.0
 
 
-def calculate_entailment_score(premise: str, hypothesis: str) -> float:
-    """
-    Lightweight entailment approximation using token overlap + structure.
-    (Full version uses DeBERTa-large-MNLI; we approximate for CPU speed.)
-    """
-    # Jaccard similarity as a proxy for entailment
-    import re
-    tokens_p = set(re.findall(r'\b\w+\b', premise.lower()))
-    tokens_h = set(re.findall(r'\b\w+\b', hypothesis.lower()))
-    if not tokens_p or not tokens_h:
-        return 0.0
-    intersection = tokens_p & tokens_h
-    return len(intersection) / len(tokens_h) if tokens_h else 0.0
+def generate_paraphrase(exp: str) -> str:
+    """Generate lexical & syntactic paraphrase of explanation."""
+    replacements = [
+        (r'\bTherefore\b', 'Consequently'),
+        (r'\bthus\b', 'hence'),
+        (r'\bbecause\b', 'since'),
+        (r'\bshows that\b', 'demonstrates that'),
+        (r'\bimportant\b', 'vital'),
+        (r'\blarge\b', 'substantial'),
+        (r'\bsmall\b', 'modest'),
+    ]
+    res = exp
+    for pattern, rep in replacements:
+        res = re.sub(pattern, rep, res, flags=re.IGNORECASE)
+    return res
+
+
+def generate_mistake(exp: str) -> str:
+    """Insert a logical mistake/contradiction into explanation."""
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', exp) if s.strip()]
+    if not sents:
+        return "However, the opposite conclusion is true. " + exp
+    mid = len(sents) // 2
+    sents[mid] = "However, it is actually false that " + sents[mid].lower()
+    return '. '.join(sents)
+
+
+def generate_counterfactual(question: str, orig_ans: str) -> tuple:
+    """Generate counterfactual question flipping the answer condition."""
+    cf_ans = 'no' if orig_ans.lower() == 'yes' else 'yes'
+    cf_q = "Is it NOT true that " + question[0].lower() + question[1:] if question else question
+    return cf_q, cf_ans
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. PROMPTING METHODS
+# 3. ANALYSIS HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-COT_PROMPT = """Answer the following question by reasoning step-by-step.
-Question: {question}
-Answer Choices: {choices}
-Let's think step by step."""
+def compute_trend_agreement(paper_results: dict, our_results: dict, metric: str) -> dict:
+    """Compute Spearman rank correlation between paper and our strategy rankings."""
+    strategies = list(paper_results.keys())
+    paper_vals = [paper_results[s][metric] for s in strategies]
+    our_vals = [our_results[s][metric] for s in strategies]
 
+    paper_ranks = np.argsort(np.argsort(paper_vals))
+    our_ranks = np.argsort(np.argsort(our_vals))
 
-def parse_answer(text: str, choices: list) -> str:
-    """Extract answer from generated text."""
-    text_lower = text.lower()
-    for c in choices:
-        if c.lower() in text_lower:
-            return c
-    return choices[0]  # default
+    n = len(strategies)
+    d_sq = sum((float(p) - float(o)) ** 2 for p, o in zip(paper_ranks, our_ranks))
+    rho = 1 - (6 * d_sq) / (n * (n**2 - 1)) if n > 1 else 1.0
 
+    if metric in ("P", "CF-UF"):
+        paper_best = strategies[np.argmin(paper_vals)]
+        our_best = strategies[np.argmin(our_vals)]
+    else:
+        paper_best = strategies[np.argmax(paper_vals)]
+        our_best = strategies[np.argmax(our_vals)]
 
-def generate_cot(model, question, choices):
-    """Standard Chain-of-Thought."""
-    prompt = COT_PROMPT.format(question=question, choices=choices)
-    output = model.generate(prompt, temperature=0.0, max_new_tokens=150)[0]
-    answer = parse_answer(output, choices)
-    return output, answer
-
-
-def generate_sc_cot(model, question, choices, n_paths=5):
-    """Self-Consistent CoT — majority vote across N paths."""
-    prompt = COT_PROMPT.format(question=question, choices=choices)
-    paths, answers = [], []
-    for _ in range(n_paths):
-        out = model.generate(prompt, temperature=0.7, max_new_tokens=150)[0]
-        ans = parse_answer(out, choices)
-        paths.append(out)
-        answers.append(ans)
-
-    majority = Counter(answers).most_common(1)[0][0]
-    # Select first path supporting majority
-    for p, a in zip(paths, answers):
-        if a == majority:
-            return p, majority, paths, answers
-    return paths[0], majority, paths, answers
-
-
-def generate_sea_cot(model, question, choices, n_paths=5):
-    """
-    Self-Entailment-Alignment CoT (Paper's proposed method).
-    S_T = S_e + S_o → select explanation with highest total score.
-    """
-    prompt = COT_PROMPT.format(question=question, choices=choices)
-    paths, answers = [], []
-    for _ in range(n_paths):
-        out = model.generate(prompt, temperature=0.7, max_new_tokens=150)[0]
-        ans = parse_answer(out, choices)
-        paths.append(out)
-        answers.append(ans)
-
-    majority = Counter(answers).most_common(1)[0][0]
-    hypothesis = f"{question} {majority}"
-
-    best_path, best_score = paths[0], -1.0
-    all_scores = []
-
-    for path, ans in zip(paths, answers):
-        if ans == majority:
-            s_e = calculate_entailment_score(path, hypothesis)
-            s_o = calculate_overlap_score(path, hypothesis)
-            s_t = s_e + s_o
-            all_scores.append({"path": path[:60], "s_e": round(s_e, 3),
-                               "s_o": round(s_o, 3), "s_t": round(s_t, 3)})
-            if s_t > best_score:
-                best_score = s_t
-                best_path = path
-
-    return best_path, majority, paths, answers, all_scores
+    return {
+        "spearman_rho": round(rho, 3),
+        "paper_best": paper_best,
+        "our_best": our_best,
+        "best_matches": paper_best == our_best,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. ABLATION: 5 SELECTION STRATEGIES
-# ═══════════════════════════════════════════════════════════════
-
-def select_by_strategy(paths, answers, question, majority, strategy):
-    """Select an explanation using a given strategy."""
-    supporting = [(p, a) for p, a in zip(paths, answers) if a == majority]
-    if not supporting:
-        return paths[0] if paths else ""
-
-    hypothesis = f"{question} {majority}"
-
-    if strategy == "random":
-        return random.choice(supporting)[0]
-    elif strategy == "max":
-        return supporting[0][0]  # first = highest prob proxy
-    elif strategy == "overlap":
-        return max(supporting, key=lambda x: calculate_overlap_score(x[0], hypothesis))[0]
-    elif strategy == "entailment":
-        return max(supporting, key=lambda x: calculate_entailment_score(x[0], hypothesis))[0]
-    elif strategy == "oe":
-        return max(supporting, key=lambda x:
-                   calculate_entailment_score(x[0], hypothesis) +
-                   calculate_overlap_score(x[0], hypothesis))[0]
-    return supporting[0][0]
-
-
-# ═══════════════════════════════════════════════════════════════
-# 5. EVALUATION METRICS
-# ═══════════════════════════════════════════════════════════════
-
-def evaluate_paraphrase_robustness(model, items, explanations):
-    """
-    Paraphrase Flip Rate (P ↓): Does changing explanation wording change the answer?
-    We simulate paraphrasing by shuffling sentences in the explanation.
-    """
-    flips = 0
-    for item, exp in zip(items, explanations):
-        # Get prediction with original explanation
-        prompt_orig = f"Based on this reasoning, answer yes or no.\nReasoning: {exp}\nQuestion: {item['question']}\nAnswer:"
-        pred_orig = parse_answer(model.generate(prompt_orig, temperature=0.0, max_new_tokens=10)[0], item['choices'])
-
-        # Create simple paraphrase (reorder sentences)
-        sentences = [s.strip() for s in exp.split('.') if s.strip()]
-        if len(sentences) > 1:
-            random.shuffle(sentences)
-        paraphrased = '. '.join(sentences) + '.'
-
-        prompt_para = f"Based on this reasoning, answer yes or no.\nReasoning: {paraphrased}\nQuestion: {item['question']}\nAnswer:"
-        pred_para = parse_answer(model.generate(prompt_para, temperature=0.0, max_new_tokens=10)[0], item['choices'])
-
-        if pred_orig != pred_para:
-            flips += 1
-
-    return (flips / len(items) * 100) if items else 0
-
-
-def evaluate_mistake_sensitivity(model, items, explanations):
-    """
-    Mistake Flip Rate (M ↑): Does inserting a mistake change the answer?
-    We simulate by negating key phrases.
-    """
-    flips = 0
-    for item, exp in zip(items, explanations):
-        prompt_orig = f"Based on this reasoning, answer yes or no.\nReasoning: {exp}\nQuestion: {item['question']}\nAnswer:"
-        pred_orig = parse_answer(model.generate(prompt_orig, temperature=0.0, max_new_tokens=10)[0], item['choices'])
-
-        # Insert mistake by negation
-        mistake_exp = exp.replace(" is ", " is not ").replace(" can ", " cannot ")
-        if mistake_exp == exp:
-            mistake_exp = "This reasoning is incorrect. " + exp
-
-        prompt_mistake = f"Based on this reasoning, answer yes or no.\nReasoning: {mistake_exp}\nQuestion: {item['question']}\nAnswer:"
-        pred_mistake = parse_answer(model.generate(prompt_mistake, temperature=0.0, max_new_tokens=10)[0], item['choices'])
-
-        if pred_orig != pred_mistake:
-            flips += 1
-
-    return (flips / len(items) * 100) if items else 0
-
-
-def evaluate_counterfactual(model, items, explanations):
-    """
-    Counterfactual Unfaithfulness (CF-UF ↓): Flip the question's expected answer,
-    see if the model adapts.
-    """
-    unfaithful = 0
-    for item, exp in zip(items, explanations):
-        # Flip the answer
-        cf_answer = 'no' if item['answer'] == 'yes' else 'yes'
-
-        prompt = f"Question: {item['question']}\nIs the answer '{cf_answer}'? Think step by step.\nAnswer:"
-        pred = parse_answer(model.generate(prompt, temperature=0.0, max_new_tokens=10)[0], item['choices'])
-
-        # If model doesn't adapt to the counterfactual, it's unfaithful
-        if pred == item['answer']:  # still gives original answer
-            unfaithful += 1
-
-    return (unfaithful / len(items) * 100) if items else 0
-
-
-# ═══════════════════════════════════════════════════════════════
-# 6. MAIN PIPELINE
+# 4. MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="Run complete reproduction pipeline")
-    parser.add_argument("--max-samples", type=int, default=20)
+    parser.add_argument("--max-samples", type=int, default=50)
     parser.add_argument("--n-paths", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--model-name", type=str, default="sshleifer/tiny-gpt2",
-                        help="HuggingFace model name")
+    parser.add_argument("--model-name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    parser.add_argument("--nli-model", type=str, default="cross-encoder/nli-deberta-v3-base")
+    parser.add_argument("--t5-model", type=str, default="google-t5/t5-small")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -343,13 +324,14 @@ def main():
 
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║  CoT Interpretability Reproduction — Full Pipeline Run     ║")
+    print("║  Paper: Yeo et al., NAACL 2024 Findings                    ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
-    # ─── Load Dataset ───
+    # ─── 1. Load Dataset ───
     print("\n[1/6] Loading StrategyQA dataset...")
     data_path = Path("data/strategyqa/processed.jsonl")
     if not data_path.exists():
-        print("  Dataset not found. Downloading...")
+        print("  Downloading StrategyQA dataset...")
         os.system(f"{sys.executable} src/data_loader.py --download --dataset strategyqa")
 
     dataset = []
@@ -361,212 +343,173 @@ def main():
     dataset = dataset[:args.max_samples]
     print(f"  Loaded {len(dataset)} examples")
 
-    # ─── Load Model ───
-    print("\n[2/6] Loading language model...")
-    model = LightweightLM(args.model_name)
+    # ─── 2. Load Models ───
+    print("\n[2/6] Loading models...")
+    lm = LightweightLM(args.model_name)
+    nli = NLIScorer(args.nli_model)
+    t5_student = T5StudentModel(args.t5_model)
 
-    # ─── Generate Reasoning Chains ───
-    print(f"\n[3/6] Generating reasoning chains (N={args.n_paths} paths per question)...")
-    all_results = []
+    # ─── 3. Generate Reasoning Chains & Compute Scores ───
+    print(f"\n[3/6] Generating reasoning chains ({args.n_paths} paths per example)...")
+    all_data = []
     t0 = time.time()
 
     for item in tqdm(dataset, desc="  Generating"):
-        # Generate N paths (shared across all strategies)
-        prompt = COT_PROMPT.format(question=item["question"], choices=item["choices"])
         paths = []
-        answers_list = []
         for _ in range(args.n_paths):
-            out = model.generate(prompt, temperature=0.7, max_new_tokens=100)[0]
-            ans = parse_answer(out, item["choices"])
-            paths.append(out)
-            answers_list.append(ans)
+            path_dict = lm.generate_cot(item["question"])
+            paths.append(path_dict)
 
-        majority = Counter(answers_list).most_common(1)[0][0]
-        hypothesis = f"{item['question']} {majority}"
+        answers = [p["answer"] for p in paths]
+        majority = Counter(answers).most_common(1)[0][0]
+        hypothesis = f"Question: {item['question']} Answer: {majority}"
 
-        # Score each path
         scored_paths = []
-        for p, a in zip(paths, answers_list):
-            s_e = calculate_entailment_score(p, hypothesis)
-            s_o = calculate_overlap_score(p, hypothesis)
-            scored_paths.append({
-                "reasoning": p, "answer": a,
-                "s_e": s_e, "s_o": s_o, "s_t": s_e + s_o
-            })
+        for p in paths:
+            if p["answer"] == majority:
+                s_e = nli.score(p["text"], hypothesis)
+                s_o = calculate_overlap_score(p["text"], hypothesis)
+                s_t = s_e + s_o
+            else:
+                s_e, s_o, s_t = 0.0, 0.0, -10.0
+            scored_paths.append({**p, "s_e": round(s_e, 4), "s_o": round(s_o, 4), "s_t": round(s_t, 4)})
 
-        all_results.append({
+        all_data.append({
             "item": item,
+            "majority": majority,
             "paths": scored_paths,
-            "majority_answer": majority,
             "is_correct": majority.lower() == item["answer"].lower()
         })
 
     gen_time = time.time() - t0
-    accuracy = sum(r["is_correct"] for r in all_results) / len(all_results) * 100
-    print(f"  Done in {gen_time:.1f}s | Task accuracy: {accuracy:.1f}%")
+    acc = sum(d["is_correct"] for d in all_data) / len(all_data) * 100
+    print(f"  Done in {gen_time:.1f}s | Majority-vote accuracy: {acc:.1f}%")
 
-    # ─── Ablation Study ───
-    print(f"\n[4/6] Running SEA-CoT ablation (5 selection strategies)...")
+    # ─── 4. Run Ablation Strategies & Interpretability Evaluation ───
+    print("\n[4/6] Running SEA-CoT ablation & evaluating interpretability metrics...")
     strategies = {
-        "Random": "random", "Max": "max", "Overlap": "overlap",
-        "Entailment": "entailment", "O&E (SEA)": "oe"
+        "Random": "random",
+        "Max": "max",
+        "Overlap": "overlap",
+        "Entailment": "entailment",
+        "O&E (SEA)": "oe"
     }
 
-    ablation_explanations = {}  # strategy -> list of selected explanations
-    for name, strat in strategies.items():
-        selected = []
-        for r in all_results:
-            paths = [(sp["reasoning"], sp["answer"]) for sp in r["paths"]]
-            answers = [sp["answer"] for sp in r["paths"]]
-            sel = select_by_strategy(
-                [p[0] for p in paths], answers,
-                r["item"]["question"], r["majority_answer"], strat
-            )
-            selected.append(sel)
-        ablation_explanations[name] = selected
+    our_results = {}
 
-    # ─── Evaluation Metrics ───
-    print(f"\n[5/6] Evaluating interpretability metrics...")
-    our_ablation = {}
-    items_for_eval = [r["item"] for r in all_results]
+    for strat_name, strat_key in strategies.items():
+        explanations = []
+        for d in all_data:
+            supp = [p for p in d["paths"] if p["answer"] == d["majority"]]
+            if not supp:
+                supp = d["paths"]
 
-    for name, explanations in tqdm(ablation_explanations.items(), desc="  Evaluating"):
-        p = evaluate_paraphrase_robustness(model, items_for_eval, explanations)
-        cf = evaluate_counterfactual(model, items_for_eval, explanations)
-        m = evaluate_mistake_sensitivity(model, items_for_eval, explanations)
-        # LAS approximation (simplified)
-        s = random.uniform(8, 18)  # LAS requires T5 student; approximate for demo
-        our_ablation[name] = {"P": round(p, 2), "CF-UF": round(cf, 2),
-                              "M": round(m, 2), "S": round(s, 2)}
+            if strat_key == "random":
+                chosen = random.choice(supp)
+            elif strat_key == "max":
+                chosen = max(supp, key=lambda x: x["log_prob"])
+            elif strat_key == "overlap":
+                chosen = max(supp, key=lambda x: x["s_o"])
+            elif strat_key == "entailment":
+                chosen = max(supp, key=lambda x: x["s_e"])
+            elif strat_key == "oe":
+                chosen = max(supp, key=lambda x: x["s_t"])
 
-    # ─── Results ───
-    print(f"\n[6/6] Results")
+            explanations.append(chosen["text"])
 
-    # Save all results
-    Path("results/tables").mkdir(parents=True, exist_ok=True)
-    Path("results/raw").mkdir(parents=True, exist_ok=True)
+        # Metric 1: P ↓ (Paraphrase flip rate)
+        p_flips = 0
+        for d, exp in zip(all_data, explanations):
+            pred1 = lm.predict_given_reasoning(exp, d["item"]["question"])
+            para = generate_paraphrase(exp)
+            pred2 = lm.predict_given_reasoning(para, d["item"]["question"])
+            if pred1 != pred2:
+                p_flips += 1
+        p_val = (p_flips / len(all_data)) * 100
 
-    # Print ablation comparison table
-    print("\n" + "═"*78)
-    print("  RESULT 1: SEA-CoT Ablation — Paper vs Ours (StrategyQA)")
-    print("═"*78)
-    print(f"  {'Strategy':<15} │ {'Paper P↓':>9} {'Ours P↓':>9} │ {'Paper CF↓':>9} {'Ours CF↓':>9} │ {'Paper M↑':>9} {'Ours M↑':>9} │ {'Paper S↑':>9} {'Ours S↑':>9}")
-    print("  " + "─"*73)
-    for name in strategies:
-        p = PAPER_ABLATION[name]
-        o = our_ablation[name]
-        print(f"  {name:<15} │ {p['P']:>9.2f} {o['P']:>9.2f} │ {p['CF-UF']:>9.2f} {o['CF-UF']:>9.2f} │ {p['M']:>9.2f} {o['M']:>9.2f} │ {p['S']:>9.2f} {o['S']:>9.2f}")
-    print("═"*78)
+        # Metric 2: CF-UF ↓ (Counterfactual Unfaithfulness)
+        cf_unfaithful = 0
+        for d, exp in zip(all_data, explanations):
+            cf_q, cf_ans = generate_counterfactual(d["item"]["question"], d["majority"])
+            pred_cf = lm.predict_given_reasoning(exp, cf_q)
+            if pred_cf == cf_ans:
+                cf_unfaithful += 1
+        cf_val = (cf_unfaithful / len(all_data)) * 100
 
-    # Print cross-method table
-    print("\n" + "═"*60)
-    print("  RESULT 2: Cross-Method Comparison (Paper Values)")
-    print("═"*60)
-    print(f"  {'Method':<15} {'P ↓':>8} {'CF-UF ↓':>10} {'M ↑':>8} {'S ↑':>8}")
-    print("  " + "─"*55)
-    for name, vals in PAPER_CROSS_METHOD.items():
-        print(f"  {name:<15} {vals['P']:>8.2f} {vals['CF-UF']:>10.2f} {vals['M']:>8.2f} {vals['S']:>8.2f}")
-    print("═"*60)
+        # Metric 3: M ↑ (Mistake flip rate)
+        m_flips = 0
+        for d, exp in zip(all_data, explanations):
+            mistake_exp = generate_mistake(exp)
+            pred_m = lm.predict_given_reasoning(mistake_exp, d["item"]["question"])
+            if pred_m != d["majority"]:
+                m_flips += 1
+        m_val = (m_flips / len(all_data)) * 100
 
-    # Show a sample SEA-CoT scoring example
-    print("\n" + "═"*60)
-    print("  RESULT 3: SEA-CoT Scoring Example (first question)")
-    print("═"*60)
-    r0 = all_results[0]
-    print(f"  Question: {r0['item']['question']}")
-    print(f"  Gold answer: {r0['item']['answer']}")
-    print(f"  Majority answer: {r0['majority_answer']}")
-    print(f"  Correct: {r0['is_correct']}")
-    print(f"\n  {'Path':>5} {'S_e':>8} {'S_o':>8} {'S_T':>8}  Selected?")
-    print("  " + "─"*50)
-    best_st = max(sp["s_t"] for sp in r0["paths"] if sp["answer"] == r0["majority_answer"])
-    for i, sp in enumerate(r0["paths"]):
-        is_best = "  ← BEST" if sp["s_t"] == best_st and sp["answer"] == r0["majority_answer"] else ""
-        support = "✓" if sp["answer"] == r0["majority_answer"] else "✗"
-        print(f"  {i+1:>5} {sp['s_e']:>8.3f} {sp['s_o']:>8.3f} {sp['s_t']:>8.3f}  {support}{is_best}")
-    print("═"*60)
+        # Metric 4: S ↑ (Simulatability / LAS)
+        las_diffs = []
+        for d, exp in zip(all_data, explanations):
+            q = d["item"]["question"]
+            gold = d["item"]["answer"].lower()
+            p_wout = t5_student.predict_probs(f"question: {q} answer yes or no:")
+            p_with = t5_student.predict_probs(f"explanation: {exp} question: {q} answer yes or no:")
+            diff = (p_with.get(gold, 0.5) - p_wout.get(gold, 0.5)) * 100
+            las_diffs.append(diff)
+        s_val = float(np.mean(las_diffs))
 
-    # Save raw results
-    with open("results/raw/all_results.json", "w") as f:
-        # Serialize without item objects
-        serializable = []
-        for r in all_results:
-            serializable.append({
-                "question": r["item"]["question"],
-                "gold_answer": r["item"]["answer"],
-                "majority_answer": r["majority_answer"],
-                "is_correct": r["is_correct"],
-                "paths": r["paths"]
-            })
-        json.dump(serializable, f, indent=2)
+        our_results[strat_name] = {
+            "P": round(p_val, 2),
+            "CF-UF": round(cf_val, 2),
+            "M": round(m_val, 2),
+            "S": round(s_val, 2)
+        }
+        print(f"  → Strategy {strat_name:12s}: P={p_val:5.2f}↓  CF-UF={cf_val:5.2f}↓  M={m_val:5.2f}↑  S={s_val:5.2f}↑")
 
-    with open("results/tables/ablation_comparison.json", "w") as f:
-        json.dump({"paper": PAPER_ABLATION, "ours": our_ablation}, f, indent=2)
+    # ─── 5. Compare with Paper & Compute Spearman Rank Correlation ───
+    print("\n[5/6] Comparing results with original paper (Table 1)...")
+    trend_analysis = {}
+    for metric in ["P", "CF-UF", "M", "S"]:
+        trend_analysis[metric] = compute_trend_agreement(PAPER_ABLATION, our_results, metric)
 
-    # Generate figures
-    print("\n  Generating figures...")
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+    print("\n" + "="*80)
+    print(f"{'Strategy':<12} | {'Paper P↓':<9} {'Ours P↓':<9} | {'Paper CF↓':<9} {'Ours CF↓':<9} | {'Paper M↑':<9} {'Ours M↑':<9} | {'Paper S↑':<9} {'Ours S↑':<9}")
+    print("-" * 80)
+    for s in PAPER_ABLATION:
+        p_p, p_o = PAPER_ABLATION[s]["P"], our_results[s]["P"]
+        cf_p, cf_o = PAPER_ABLATION[s]["CF-UF"], our_results[s]["CF-UF"]
+        m_p, m_o = PAPER_ABLATION[s]["M"], our_results[s]["M"]
+        s_p, s_o = PAPER_ABLATION[s]["S"], our_results[s]["S"]
+        print(f"{s:<12} | {p_p:<9.2f} {p_o:<9.2f} | {cf_p:<9.2f} {cf_o:<9.2f} | {m_p:<9.2f} {m_o:<9.2f} | {s_p:<9.2f} {s_o:<9.2f}")
+    print("="*80)
 
-        fig, axes = plt.subplots(1, 4, figsize=(18, 5))
-        fig.suptitle("SEA-CoT Ablation: Paper vs Our Reproduction (StrategyQA)",
-                     fontsize=14, fontweight='bold')
+    print("\nTREND CORRELATION ANALYSIS (Spearman ρ):")
+    for m, info in trend_analysis.items():
+        print(f"  Metric {m:5s}: Spearman ρ = {info['spearman_rho']:+.3f} | Paper Best: {info['paper_best']:10s} | Our Best: {info['our_best']:10s}")
 
-        metrics = [("P", "P ↓ (lower=better)"), ("CF-UF", "CF-UF ↓ (lower=better)"),
-                   ("M", "M ↑ (higher=better)"), ("S", "S ↑ (higher=better)")]
-        strat_names = list(strategies.keys())
-        x = np.arange(len(strat_names))
-        w = 0.35
+    # ─── 6. Save Table & Update Files ───
+    print("\n[6/6] Saving outputs...")
+    out_dir = Path("results/tables")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        for idx, (key, title) in enumerate(metrics):
-            ax = axes[idx]
-            paper_vals = [PAPER_ABLATION[s][key] for s in strat_names]
-            our_vals = [our_ablation[s][key] for s in strat_names]
+    summary_data = {
+        "paper": PAPER_ABLATION,
+        "ours": our_results,
+        "config": {
+            "model": args.model_name,
+            "nli_model": args.nli_model,
+            "t5_model": args.t5_model,
+            "n_samples": len(dataset),
+            "n_paths": args.n_paths,
+            "seed": args.seed,
+            "accuracy": round(acc, 2)
+        },
+        "trend_analysis": trend_analysis
+    }
 
-            bars1 = ax.bar(x - w/2, paper_vals, w, label='Paper', color='#2196F3', edgecolor='black', linewidth=0.5)
-            bars2 = ax.bar(x + w/2, our_vals, w, label='Ours', color='#F44336', edgecolor='black', linewidth=0.5)
+    with open(out_dir / "ablation_comparison.json", "w") as f:
+        json.dump(summary_data, f, indent=2)
 
-            ax.set_title(title, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels([s.replace(" (SEA)", "\n(SEA)") for s in strat_names],
-                               rotation=45, ha='right', fontsize=8)
-            if idx == 0:
-                ax.legend(fontsize=9)
-
-        plt.tight_layout()
-        plt.savefig("results/figures/ablation_paper_vs_ours.png", dpi=150, bbox_inches='tight')
-        plt.close()
-        print("  ✓ results/figures/ablation_paper_vs_ours.png")
-
-        # Also regenerate cross-method and radar charts
-        os.system(f"{sys.executable} experiments/generate_figures.py --output-dir results/figures 2>/dev/null")
-
-    except ImportError:
-        print("  matplotlib not available, skipping figures")
-
-    # Final summary
-    print("\n" + "╔"+"═"*60+"╗")
-    print("║" + " PIPELINE COMPLETE".center(60) + "║")
-    print("╠"+"═"*60+"╣")
-    print(f"║  Model:     {args.model_name:<46} ║")
-    print(f"║  Dataset:   StrategyQA ({len(dataset)} examples){' '*(30-len(str(len(dataset))))} ║")
-    print(f"║  N paths:   {args.n_paths:<46} ║")
-    print(f"║  Runtime:   {gen_time:.1f}s{' '*(44-len(f'{gen_time:.1f}'))} ║")
-    print(f"║  Accuracy:  {accuracy:.1f}%{' '*(43-len(f'{accuracy:.1f}'))} ║")
-    print("╠"+"═"*60+"╣")
-    print("║  Outputs:".ljust(61) + "║")
-    print("║    results/raw/all_results.json".ljust(61) + "║")
-    print("║    results/tables/ablation_comparison.json".ljust(61) + "║")
-    print("║    results/figures/ablation_paper_vs_ours.png".ljust(61) + "║")
-    print("║    results/figures/ablation_study.png".ljust(61) + "║")
-    print("║    results/figures/cross_method_radar.png".ljust(61) + "║")
-    print("╚"+"═"*60+"╝")
-
-    print("\nNOTE: Results use a tiny model for pipeline demonstration.")
-    print("For paper-matching results, use Llama-2-70B-chat-GPTQ on GPU.")
-    print("The trend and methodology are identical to the paper.")
+    print(f"  Saved comparison JSON to {out_dir / 'ablation_comparison.json'}")
+    print("\nPipeline execution complete!")
 
 
 if __name__ == "__main__":
