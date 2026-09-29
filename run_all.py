@@ -98,7 +98,7 @@ class LightweightLM:
         param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
         print(f"  LLM loaded on {self.device} ({param_count:.1f}M params)")
 
-    def generate_cot(self, question: str, max_new_tokens: int = 120, temperature: float = 0.7) -> dict:
+    def generate_cot(self, question: str, max_new_tokens: int = 80, temperature: float = 0.7) -> dict:
         """Generate a single CoT path with sequence log probability."""
         messages = [
             {"role": "system", "content": "You are a precise reasoning assistant. Think step by step and end your response with 'Answer: Yes' or 'Answer: No'."},
@@ -236,6 +236,14 @@ def calculate_overlap_score(explanation: str, question_answer: str) -> float:
     intersection = set_e & set_qa
     union = set_e | set_qa
     return len(intersection) / len(union) if union else 0.0
+
+
+def sanitize_explanation_for_las(exp: str) -> str:
+    """Remove explicit leading answer label so T5 simulates reasoning rather than copying leaked label."""
+    clean = re.sub(r'^(yes|no)[,\s.:]*', '', exp, flags=re.IGNORECASE)
+    clean = re.sub(r'answer:\s*(yes|no)[,\s.:]*', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'therefore,\s*the\s*answer\s*is\s*(yes|no)[,\s.:]*', '', clean, flags=re.IGNORECASE)
+    return clean.strip()
 
 
 def generate_paraphrase(exp: str) -> str:
@@ -450,8 +458,9 @@ def main():
         for d, exp in zip(all_data, explanations):
             q = d["item"]["question"]
             gold = d["item"]["answer"].lower()
-            p_wout = t5_student.predict_probs(f"question: {q} answer yes or no:")
-            p_with = t5_student.predict_probs(f"explanation: {exp} question: {q} answer yes or no:")
+            clean_exp = sanitize_explanation_for_las(exp)
+            p_wout = t5_student.predict_probs(f"question: {q} option: yes or no")
+            p_with = t5_student.predict_probs(f"explanation: {clean_exp} question: {q} option: yes or no")
             diff = (p_with.get(gold, 0.5) - p_wout.get(gold, 0.5)) * 100
             las_diffs.append(diff)
         s_val = float(np.mean(las_diffs))
